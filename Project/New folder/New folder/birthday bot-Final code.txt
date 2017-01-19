@@ -1,0 +1,184 @@
+#include "msp430x22x4.h"
+#include "stdint.h"
+volatile uint8_t sensor[4];
+unsigned Cds1=0, Cds2=0, IR1=0, IR2=0;
+#define light 50              //Define light condition
+#define candle 650            //define candle detected condition
+#define tape 700              //Black tape detected condition
+#define thres 120             //Threshold to compare two cds sensors
+void main(void) 
+{
+  WDTCTL = WDTPW + WDTHOLD;       // Stop WDT
+  ADC10CTL1 = INCH_15 + CONSEQ_3 + ADC10SSEL_3; //Channels A12, A13, A14, A15 
+                                               //sequence of channels, SMCLK
+  ADC10CTL0 = ADC10SHT_2 + MSC + ADC10ON + ADC10IE;  //16cycles, Multi sample 
+                                    //and conversion, ADC ON, interrupt enable
+  ADC10DTC1 = 0x04;               // 4 conversions
+  ADC10AE1 |= 0xF0;     //  Bit 4,5,6,7 corresponding to channels
+  P1DIR |= 0x01;        // Set P1.0 output
+
+  P2DIR |= 0x04;         //set P2.2 as muffin fan out
+  P3SEL = 0x30;          //UART TXD/RXD
+  P2OUT &= ~0x04;        //muffin fan off
+  
+   // Config. UART Clock & Baud Rate 
+  BCSCTL1 = CALBC1_1MHZ;                // DCO = 1 MHz
+  DCOCTL  = CALDCO_1MHZ;                // DCO = 1 MHz
+  UCA0CTL1 |= UCSSEL_2;                 // UART use SMCLK
+
+  UCA0MCTL = UCBRS0;                    // Map 1MHz -> 9600 (Tbl 15-4)
+  UCA0BR0  = 104;                       // Map 1MHz -> 9600 (Tbl 15-4)
+  UCA0BR1  = 0;                         // Map 1MHz -> 9600 (Tbl 15-4)
+
+  UCA0CTL1 &= ~UCSWRST;                 // Enable USCI state mach
+
+  while ( !(IFG2 & UCA0TXIFG)) {};      // Confirm that Tx Buff is empty
+  UCA0TXBUF = 0x00;                     // Init robot to stopped state
+
+  
+  
+  TACCR0 = 24000;                      //20ms signal period
+  TACTL   = TASSEL_2 | ID_0 | MC_1 | TAIE ;   // Sel. SMCLK | div by 1 
+                                       //| UP Mode | Interrupt Enabled 
+  TACCTL1 = CCIS0 | OUTMOD_2;         // Chnl-1 Inp=CCI1B | OUTMOD=Tgl/Rst
+                                      // Note: Compare mode is default
+
+  for (;;)
+  {
+   ADC10CTL0 &= ~ENC;
+   while (ADC10CTL1 & BUSY){};         // Wait if ADC10 core is active
+   ADC10SA = (unsigned int)&sensor[0]; // Data buffer start
+   P1OUT |= 0x01;                      // P1.0 = 1
+   ADC10CTL0 |= ENC + ADC10SC;        // Sampling and conversion start
+   __bis_SR_register(CPUOFF + GIE);   // LPM0, ADC10_ISR will force exit
+   }
+}
+
+// ADC10 interrupt service routine
+#pragma vector=ADC10_VECTOR
+__interrupt void ADC10_ISR (void)
+{ 
+  //P2OUT &= ~0x04;     //turn FAN OFF P2.2
+  Cds1 = sensor[3];    //Photoresistor 1
+  Cds2 = sensor[2];    //Photoresistor 2
+  IR1  = sensor[1];    //IR sensor 1
+  IR2 = sensor[0];     //IR sensor 2
+  
+ 
+  if((IR1 < tape) && (IR2 < tape))       //Is black tape detected?
+  {
+   if((Cds1 >= light) || (Cds2 >= light))  // Is lit candle detected?
+    {
+     if(((Cds1 - Cds2) < thres) || ((Cds2 - Cds1) < thres)) 
+                                             //if light is in front?
+      {
+         while ( !(IFG2 & UCA0TXIFG)) {}; // Confirm that Tx Buff is empty                   
+         UCA0TXBUF = 96;                     // Robot in 1/2 forward state
+         while ( !(IFG2 & UCA0TXIFG)) {};    // Confirm that Tx Buff is empty
+         UCA0TXBUF = 224 ;                   // Robot in 1/2 forward state
+       }
+       else if(Cds1 > Cds2)                //Is candle in left/right?
+        {
+           while ( !(IFG2 & UCA0TXIFG)) {};   // Confirm that Tx Buff is empty                      
+           UCA0TXBUF = 112;                  // Robot in 3/4 forward Spin state
+           while ( !(IFG2 & UCA0TXIFG)) {};   // Confirm that Tx Buff is empty
+           UCA0TXBUF = 144;                  // Robot in 3/4 reverse Spin state
+         }
+       else if(Cds1 < Cds2)             //candle is in left/right
+        {
+           while ( !(IFG2 & UCA0TXIFG)) {};  //Confirm that Tx Buff is empty                      
+           UCA0TXBUF = 16;                  // Robot in 3/4 reverse Spin state
+           while ( !(IFG2 & UCA0TXIFG)) {};  //Confirm that Tx Buff is empty
+           UCA0TXBUF = 236 ;                // Robot in 3/4 forward Spin state
+         }
+      }
+
+    else			             // if in darkness
+     {
+        while ( !(IFG2 & UCA0TXIFG)) {};    // Confirm that Tx Buff is empty                      
+        UCA0TXBUF = 16;                     // Robot in 3/4 reverse Spin state
+        while ( !(IFG2 & UCA0TXIFG)) {};   // Confirm that Tx Buff is empty
+        UCA0TXBUF = 236 ;                  // Robot in 3/4 forward Spin state
+      }	
+   }
+  
+ if( ( IR1 >= tape ) && ( IR2 < tape )) // Is tape detected on one side?
+  {
+      while ( !(IFG2 & UCA0TXIFG)) {};     //Confirm that Tx Buff is empty
+      UCA0TXBUF = 0 ;                     // Robot in stop state
+      __delay_cycles(50);                 //1 sec delay
+ 
+      while ( !(IFG2 & UCA0TXIFG)) {};     //Confirm that Tx Buff is empty                      
+      UCA0TXBUF = 32;                     // Robot in 1/2 reverse state
+      while ( !(IFG2 & UCA0TXIFG)) {};    //Confirm that Tx Buff is empty
+      UCA0TXBUF = 160;                    // Robot in 1/2 reverse state
+      __delay_cycles(200);                //4 secs delay
+	  
+      while ( !(IFG2 & UCA0TXIFG)) {};    // Confirm that Tx Buff is empty                      
+      UCA0TXBUF = 112;                    // Robot in 3/4 forward Spin state
+      while ( !(IFG2 & UCA0TXIFG)) {};    // Confirm that Tx Buff is empty
+      UCA0TXBUF =  144;                   // Robot in 3/4 reverse Spin state
+      __delay_cycles(150);               //3 secs delay
+   }
+ 
+  
+ if(( IR1 < tape ) && ( IR2 >= tape ))  // Is tape detected on one side?
+  {
+      while ( !(IFG2 & UCA0TXIFG)) {};    // Confirm that Tx Buff is empty
+      UCA0TXBUF = 0 ;                     //Robot in stop state
+      __delay_cycles(50);                 //1 sec delay
+ 
+      while ( !(IFG2 & UCA0TXIFG)) {};    // Confirm that Tx Buff is empty                      
+      UCA0TXBUF = 32;                     // Robot in 1/2 reverse state
+      while ( !(IFG2 & UCA0TXIFG)) {};    // Confirm that Tx Buff is empty
+      UCA0TXBUF = 160;                    // Robot in 1/2 reverse state
+      __delay_cycles(200);                //4 secs delay
+
+	  
+       while ( !(IFG2 & UCA0TXIFG)) {};    // Confirm that Tx Buff is empty                      
+       UCA0TXBUF = 16;                     // Robot in 3/4 reverse Spin state
+       while ( !(IFG2 & UCA0TXIFG)) {};    // Confirm that Tx Buff is empty
+       UCA0TXBUF = 236;                    // Robot in 3/4 forward Spin state
+       __delay_cycles(150);                //3 secs delay
+    }
+
+
+ if(( Cds1 >= candle) && (Cds2 >= candle))   //Is candle in front?  
+  {
+   if( (IR1 >= tape) && (IR2 >= tape))     //Is black tape is detected?
+    {
+        while ( !(IFG2 & UCA0TXIFG)) {};    // Confirm that Tx Buff is empty  
+        UCA0TXBUF = 0x00;                   // robot in stopped state
+        P2OUT |= 0x04;                     //muffin fan ON
+     }
+   }
+      
+ else if(( Cds1 < candle) && (Cds2 < candle))    //Is Candle blown out?
+  {
+    if( (IR1 >= tape) && (IR2 >= tape)) // Check if the black tape is detect
+     {
+        __delay_cycles(250);              //5 sec delay for fan
+        P2OUT &= ~0x04;                   //Muffin fan Off
+            
+        while ( !(IFG2 & UCA0TXIFG)) {};  // Confirm that Tx Buff is empty
+        UCA0TXBUF = 1 ;                   // Robot in full Reverse state
+        while ( !(IFG2 & UCA0TXIFG)) {};  // Confirm that Tx Buff is empty
+        UCA0TXBUF = 128 ;                 // Robot in full Reverse state
+        __delay_cycles(250);              //5 secs
+                  
+        while ( !(IFG2 & UCA0TXIFG)) {};  // Confirm that Tx Buff is empty                   
+        UCA0TXBUF = 1;                    //Robot in full reverse Spin state
+        while ( !(IFG2 & UCA0TXIFG)) {};  // Confirm that Tx Buff is empty
+        UCA0TXBUF = 255;                   // Robot in full forward Spin state
+        __delay_cycles(250);              //5 secs delay
+            
+        while ( !(IFG2 & UCA0TXIFG)) {};  // Confirm that Tx Buff is empty                   
+        UCA0TXBUF = 96;                   //Robot in 1/2 forward state
+        while ( !(IFG2 & UCA0TXIFG)) {};  // Confirm that Tx Buff is empty
+        UCA0TXBUF = 224 ;                 // Robot in 1/2 forward state
+        __delay_cycles(250);             //5 secs delay
+     }
+  }
+ __bic_SR_register_on_exit(CPUOFF);     // Clear CPUOFF bit from 0(SR)
+} 
+
